@@ -1,0 +1,37 @@
+version: '3.4'
+services:
+  mail:
+    build:
+      context: .
+      dockerfile: ./Dockerfile.build
+      network: host
+    image: faperezg/mailserver:latest
+    hostname: ${MAIL_HOSTNAME}
+    domainname: ${MAIL_DOMAINNAME}
+    container_name: ${CONTAINER_NAME}
+    expose:
+    - "25"
+    - "80"
+    - "143"
+    - "443"
+    - "587"
+    volumes:
+    - maildata:/var/mail
+    - mailstate:/var/mail-state
+    - maillogs:/var/log/mail
+    - mysqldata:/var/lib/mysql
+    env_file:
+    - .env
+    cap_add:
+    - NET_ADMIN
+    - SYS_PTRACE
+    restart: "no"
+volumes:
+  maildata:
+    driver: local
+  mailstate:
+    driver: local
+  maillogs:
+    driver: local
+  mysqldata:
+    driver: local

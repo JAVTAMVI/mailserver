@@ -1,0 +1,204 @@
+#
+# Stage # 1: Install software + self signed SSL certificates
+#
+FROM debian:stretch-slim AS INSTALLER
+
+LABEL maintainer="Felipe A Perez G"  \
+    org.label-schema.name="seezard-mailserver" \
+    org.label-schema.description="Development mail server with self signed certificates (smtp, imap, ssl/tls)"
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG MAIL_HOSTNAME
+ARG MAIL_DOMAINNAME
+ARG CONTAINER_NAME
+ARG MYSQL_ROOT_PASSWORD
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Packages
+# hadolint ignore=DL3015
+#
+# Install packages, configure
+RUN echo "deb http://security.debian.org/debian-security stretch/updates main contrib non-free" > /etc/apt/sources.list && \
+    echo "deb http://deb.debian.org/debian/ stretch main contrib non-free" >> /etc/apt/sources.list && \
+    echo "deb http://deb.debian.org/debian/ stretch-updates main contrib non-free" >> /etc/apt/sources.list && \
+    echo "deb http://ftp.debian.org/debian stretch-backports main contrib non-free" >> /etc/apt/sources.list && \
+    apt update -q --fix-missing && \
+    apt -y upgrade && \
+    debconf-set-selections <<< 'mariadb-server-10.0 mysql-server/root_password password ${MYSQL_ROOT_PASSWORD}' && \
+    debconf-set-selections <<< 'mariadb-server-10.0 mysql-server/root_password_again password ${MYSQL_ROOT_PASSWORD}' && \
+    debconf-set-selections <<< "postfix postfix/main_mailer_type string 'No configuration'" && \
+    apt install -y postfix && \
+    apt install -y --no-install-recommends \
+        apache2 \
+        apt-transport-https \
+        arj \
+        binutils \
+        bzip2 \
+        ca-certificates \
+        cabextract \
+        cpio \
+        curl \
+        dovecot-imapd \
+        dovecot-lmtpd \
+        dovecot-managesieved \
+        dovecot-mysql \
+        ed \
+        file \
+        gamin \
+        gzip \
+        gnupg \
+        iproute2 \
+        iptables \
+        libapache2-mod-php7.0 \
+        libdate-manip-perl \
+        liblz4-tool \
+        libmail-spf-perl \
+        libnet-dns-perl \
+        libsasl2-modules \
+        locales \
+        lrzip \
+        lzop \
+        mysql-server \
+        netcat-openbsd \
+        nomarch \
+        pax \
+        pflogsumm \
+        p7zip-full \
+        php7.0 \
+        php7.0-common \
+        php7.0-curl \
+        php7.0-dev \
+        php7.0-gd \
+        php7.0-imagick \
+        php7.0-intl \
+        php7.0-ldap \
+        php7.0-json \
+        php7.0-mysql \
+        php7.0-mbstring \
+        php-pear \
+        php7.0-xml \
+        php7.0-zip \
+        postfix \
+        postfix-mysql \
+        rsyslog \
+        sasl2-bin \
+        shared-mime-info \
+        supervisor \
+        unrar-free \
+        unzip \
+        wget \
+        whois \
+        xml-core \
+        xz-utils \
+        && \
+    wget https://github.com/roundcube/roundcubemail/releases/download/1.4.2/roundcubemail-1.4.2-complete.tar.gz && \
+    tar -xzf roundcubemail-* -C /var/www --transform s/roundcubemail-1.4.2/roundcube/ && \
+    rm -rf roundcubemail-1.4.2-complete.tar.gz && \
+    chown -R www-data /var/www/roundcube && \
+    apt remove -y 'exim4*' && \
+    apt-get autoclean && \
+    rm -rf /var/lib/apt/lists/* && \
+    rm -rf /usr/share/locale/* && \
+    rm -rf /usr/share/man/* && \
+    rm -rf /usr/share/doc/* && \
+    sed -i "s/;date.timezone =/date.timezone = America\/Caracas/g" /etc/php/7.0/apache2/php.ini && \
+	echo $MAIL_HOSTNAME.$MAIL_DOMAINNAME >> /etc/mailname
+
+# Create self signed certificates
+RUN openssl req -x509 -newkey rsa:4096 -sha512 -days 3650 -nodes -keyout /etc/ssl/private/$MAIL_HOSTNAME.$MAIL_DOMAINNAME.pem -out /etc/ssl/certs/$MAIL_HOSTNAME.$MAIL_DOMAINNAME.pem -subj "/CN=$MAIL_DOMAINNAME" && \
+    chmod go= /etc/ssl/private/$MAIL_HOSTNAME.$MAIL_DOMAINNAME.pem
+
+#
+# Stage # 2: Configure services
+#
+FROM INSTALLER
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG MAIL_HOSTNAME
+ARG MAIL_DOMAINNAME
+ARG CONTAINER_NAME
+ARG MYSQL_ROOT_PASSWORD
+
+# Configure postfix
+COPY target/postfix/* /etc/postfix/
+
+RUN echo "Configuring Postfix" && \
+	service mysql restart && \
+    mysql -uroot -p${MYSQL_ROOT_PASSWORD} -e "DROP DATABASE IF EXISTS mailserver; CREATE DATABASE mailserver DEFAULT CHARACTER SET 'utf8' COLLATE 'utf8_unicode_ci'; GRANT ALL PRIVILEGES ON mailserver.* TO mailuser@localhost IDENTIFIED BY 'Str0nGPa55W0rd'; GRANT ALL PRIVILEGES ON mailserver.* TO mailadmin@localhost IDENTIFIED BY 'Str0nGPa55W0rd'; FLUSH PRIVILEGES; USE mailserver; CREATE TABLE IF NOT EXISTS virtual_domains ( id int(11) NOT NULL auto_increment, name varchar(50) NOT NULL, PRIMARY KEY (id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8; CREATE TABLE IF NOT EXISTS virtual_users ( id int(11) NOT NULL auto_increment,  domain_id int(11) NOT NULL, email varchar(100) NOT NULL, password varchar(150) NOT NULL, PRIMARY KEY (id), UNIQUE KEY email (email), FOREIGN KEY (domain_id) REFERENCES virtual_domains (id) ON DELETE CASCADE ) ENGINE=InnoDB DEFAULT CHARSET=utf8; CREATE TABLE IF NOT EXISTS virtual_aliases ( id int(11) NOT NULL auto_increment, domain_id int(11) NOT NULL, source varchar(100) NOT NULL, destination varchar(100) NOT NULL, PRIMARY KEY (id), FOREIGN KEY (domain_id) REFERENCES virtual_domains(id) ON DELETE CASCADE ) ENGINE=InnoDB DEFAULT CHARSET=utf8;" && \
+	mysql --user=mailuser --password=Str0nGPa55W0rd --database=mailserver < /etc/postfix/create-users.sql && \
+	rm -rf /etc/postfix/create-users.sql && \
+	postconf virtual_mailbox_domains=mysql:/etc/postfix/mysql-virtual-mailbox-domains.cf && \
+	postconf virtual_mailbox_maps=mysql:/etc/postfix/mysql-virtual-mailbox-maps.cf && \
+	postconf virtual_alias_maps=mysql:/etc/postfix/mysql-virtual-alias-maps.cf && \
+	postconf virtual_alias_maps=mysql:/etc/postfix/mysql-virtual-alias-maps.cf,mysql:/etc/postfix/mysql-email2email.cf && \
+	postconf myorigin=$MAIL_HOSTNAME.$MAIL_DOMAINNAME && \
+	postconf smtpd_tls_cert_file=/etc/ssl/certs/$MAIL_HOSTNAME.$MAIL_DOMAINNAME.pem && \
+	postconf smtpd_tls_key_file=/etc/ssl/private/$MAIL_HOSTNAME.$MAIL_DOMAINNAME.pem && \
+	postconf myhostname=$MAIL_HOSTNAME.$MAIL_DOMAINNAME && \
+	postconf smtpd_sasl_auth_enable=yes && \
+	postconf smtpd_sasl_type=dovecot && \
+	postconf smtpd_sasl_path=private/auth && \
+	postconf smtpd_sasl_auth_enable=yes && \
+	postconf smtpd_relay_restrictions=permit_mynetworks,permit_sasl_authenticated,reject_unauth_destination && \
+	postconf smtpd_sender_restrictions=permit_sasl_authenticated && \
+	postconf smtpd_tls_security_level=may && \
+	postconf smtpd_tls_auth_only=yes && \
+	postconf smtp_tls_security_level=may && \
+	chgrp postfix /etc/postfix/mysql-*.cf && \
+	chmod u=rw,g=r,o= /etc/postfix/mysql-*.cf
+
+# Configure Dovecot
+COPY target/dovecot/conf.d/* /etc/dovecot/conf.d/
+COPY target/dovecot/* /etc/dovecot/
+
+RUN groupadd -g 5000 vmail && \
+    useradd -g vmail -u 5000 vmail -d /var/vmail -m && \
+    chown -R vmail.vmail /var/vmail && \
+    sed -i "s/webmail/$MAIL_HOSTNAME/g" /etc/postfix/mysql-email2email.cf && \
+    sed -i "s/webmail/$MAIL_HOSTNAME/g" /etc/dovecot/conf.d/10-ssl.conf && \
+    sed -i "s/domain.com/$MAIL_DOMAINNAME/g" /etc/dovecot/conf.d/10-ssl.conf && \
+    chown root:root /etc/dovecot/dovecot-sql.conf.ext && \
+    chmod go= /etc/dovecot/dovecot-sql.conf.ext && \
+    service dovecot restart && \
+	postconf virtual_transport=lmtp:unix:private/dovecot-lmtp
+
+# Configure roundcube
+COPY target/roundcube/http*.roundcube.conf /etc/apache2/sites-available/
+COPY target/roundcube/plugins/password/config.inc.php /var/www/roundcube/plugins/password/
+COPY target/roundcube/config.inc.php /var/www/roundcube/config
+
+RUN service mysql restart && \
+	mysql -uroot -p${MYSQL_ROOT_PASSWORD} -e "DROP DATABASE IF EXISTS roundcube; CREATE DATABASE roundcube DEFAULT CHARACTER SET 'utf8' COLLATE 'utf8_unicode_ci'; GRANT ALL PRIVILEGES ON roundcube.* TO roundcubeuser@localhost IDENTIFIED BY 'Str0nGPa55W0rd'; FLUSH PRIVILEGES;" && \
+    mysql --user=roundcubeuser --password=Str0nGPa55W0rd --database=roundcube < /var/www/roundcube/SQL/mysql.initial.sql && \
+	sed -i "s/webmail/$MAIL_HOSTNAME/g" /etc/apache2/sites-available/http.roundcube.conf && \
+    sed -i "s/domain.com/$MAIL_DOMAINNAME/g" /etc/apache2/sites-available/http.roundcube.conf && \
+	sed -i "s/webmail/$MAIL_HOSTNAME/g" /etc/apache2/sites-available/https.roundcube.conf && \
+    sed -i "s/domain.com/$MAIL_DOMAINNAME/g" /etc/apache2/sites-available/https.roundcube.conf && \
+    sed -i "s/domain.com/$MAIL_DOMAINNAME/g" /var/www/roundcube/config/config.inc.php && \
+	sed -i "s/webmail/$MAIL_HOSTNAME/g" /etc/postfix/mysql-virtual-mailbox-domains.cf && \
+    sed -i "s/domain.com/$MAIL_DOMAINNAME/g" /etc/postfix/mysql-virtual-mailbox-domains.cf && \
+	chown www-data /var/www/roundcube/plugins/password/config.inc.php && \
+	cp /var/www/roundcube/plugins/managesieve/config.inc.php.dist /var/www/roundcube/plugins/managesieve/config.inc.php && \
+	chown www-data /var/www/roundcube/plugins/managesieve/config.inc.php && \
+    a2enmod rewrite && \
+    a2enmod ssl && \
+    a2ensite http.roundcube && \
+    a2ensite https.roundcube && \
+    a2dissite 000-default && \
+    rm -rf /var/www/roundcube/installer && \
+    service apache2 restart
+
+# Configure supervisor
+COPY target/supervisor/supervisord.conf /etc/supervisor/supervisord.conf
+
+# Copy endpoint
+COPY ./target/* /usr/local/bin/
+
+RUN chmod +x /usr/local/bin/*
+
+WORKDIR /
+
+EXPOSE 25 80 143
+
+CMD ["supervisord", "-c", "/etc/supervisor/supervisord.conf"]
